@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: httpenv
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: httpenv
+  template:
+    metadata:
+      labels:
+        app: httpenv
+    spec:
+      # This tells Kubernetes to use the secret created in the step above
+      # so it has permission to pull your newly built image from GHCR
+      imagePullSecrets:
+        - name: regcred
+      containers:
+      - name: httpenv
+        image: ${TESTING_IMAGE}
+        ports:
+        - containerPort: 8888
