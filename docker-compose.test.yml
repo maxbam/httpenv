@@ -1,6 +1,8 @@
 services:
   app:
     image: "{TESTING_IMAGE}"
+  sut:
+    image: "{TESTING_IMAGE}"
     depends_on:
       app:
         condition: service_started
