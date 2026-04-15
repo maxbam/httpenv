@@ -1,5 +1,5 @@
 ---
-name: 10 Build and Smoke Test
+name: 99 Parallelize Jobs
 
 on:
   push:
@@ -8,31 +8,21 @@ on:
   pull_request:
 
 jobs:
-  build-image:
-    name: Build Image
+# FIRST JOB: Build and push the test image to GHCR so other jobs can pull it
+  build-test-image:
+    name: Build Image for Testing
     runs-on: ubuntu-latest
 
     permissions:
       contents: read # for actions/checkout to fetch code
-      security-events: write # for github/codeql-action/upload-sarif to upload SARIF results
       packages: write
 
     steps:
-
       - name: Checkout git repo 
         uses: actions/checkout@v6
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
-      
-      - name: Login to Docker Hub
-        uses: docker/login-action@v4
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
       
       - name: Login to ghcr.io registry
         uses: docker/login-action@v4
@@ -49,6 +39,76 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64
+
+# PARALLEL JOB: Unit Tests
+  test-unit:
+    name: Unit Testing in Docker
+    needs: [build-test-image]
+    runs-on: ubuntu-latest
+
+    permissions:
+      packages: read
+    
+    steps:
+
+      - name: Login to ghcr.io registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Unit Testing in Docker
+        run: |
+          docker run --rm ghcr.io/${{ github.repository }}:${{ github.run_id }} echo "run test commands here"
+
+# PARALLEL JOB: Docker Compose Integration Tests
+
+  test-integration:
+    name: Test healthcheck in Docker Compose
+    needs: [build-test-image]
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: read
+    
+    steps:
+      - name: Checkout git repo 
+        uses: actions/checkout@v6
+      
+      - name: Login to ghcr.io registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}      
+
+      - name: Test healthcheck in Docker Compose
+        run: |
+          export TESTING_IMAGE="ghcr.io/${{ github.repository }}:${{ github.run_id }}"
+          docker compose -f docker-compose.test.yml up --exit-code-from sut
+
+# PARALLEL JOB: Kubernetes Smoke Tests
+  test-k3d:
+    name: Smoke test deployment in k3d Kubernetes
+    needs: [build-test-image]
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Checkout git repo
+        uses: actions/checkout@v6
+
+      - name: Login to ghcr.io registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: AbsaOSS/k3d-action@v2
         with: 
@@ -70,36 +130,43 @@ jobs:
           kubectl exec deploy/httpenv -- sh -c "wget --spider http://localhost:8888 || exit 1"
 
 
-      - name: Build and export to Docker
-        uses: docker/build-push-action@v7
+# PARALLEL JOB: Vulnerability Scanning
+  scan-image:
+    name: Scan Image with Trivy
+    needs: [build-test-image]
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: read 
+      security-events: write # for github/codeql-action/upload-sarif to upload SARIF results
+    
+    steps:
+
+      - name: Checkout git repo
+        uses: actions/checkout@v6
+        
+      - name: Login to ghcr.io registry
+        uses: docker/login-action@v4
         with:
-          push: false
-          load: true # Export to Docker Engine rather than pushing to a registry
-          tags: ${{ github.run_id }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          platforms: linux/amd64
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Unit Testing in Docker
-        run: |
-          docker run --rm ${{ github.run_id }} echo "run test commands here"
-
-      - name: Test healthcheck in Docker Compose
-        run: |
-          export TESTING_IMAGE="${{ github.run_id }}"
-          docker compose -f docker-compose.test.yml up --exit-code-from sut
+      - name: Pull image to scan
+        run: docker pull ghcr.io/${{ github.repository }}:${{ github.run_id }}
 
       - name: Run Trivy for all CVEs (non-blocking)
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ${{ github.run_id }}
+          image-ref: ghcr.io/${{ github.repository }}:${{ github.run_id }}
           exit-code: 0
           format: table
 
       - name: Run Trivy for HIGH,CRITICAL CVEs and report (blocking)
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ${{ github.run_id }}
+          image-ref: ghcr.io/${{ github.repository }}:${{ github.run_id }}
           exit-code: 0 # exit code 0 for testing
           ignore-unfixed: true
           vuln-type: 'os,library'
@@ -113,6 +180,33 @@ jobs:
         with:
           sarif_file: 'trivy-results.sarif'
 
+# FINAL JOB: Build Multi-Arch and Push to Docker Hub
+  build-final-image:
+    name: Build Final Image
+    needs: [test-unit, test-integration, test-k3d, scan-image]
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+      pull-requests: write # needed to create and update comments in PRs
+
+    steps:
+      - name: Checkout git repo 
+        uses: actions/checkout@v6
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Docker Metadata for Final Image Build
         id: docker_meta
         uses: docker/metadata-action@v6
@@ -121,13 +215,8 @@ jobs:
           flavor: |
             latest=false
           tags: |
-            type=raw,value=10
-          # comment these out on all but 04-add-metadata.yaml to avoid overwriting image tags
-          # type=raw,value=latest,enable=${{ endsWith(github.ref, github.event.repository.default_branch) }}
-          # type=ref,event=pr
-          # type=ref,event=branch
-          # type=semver,pattern={{version}}
-      
+            type=raw,value=99
+
       - name: Docker Build and Push to Docker Hub
         uses: docker/build-push-action@v7
         with:
@@ -136,10 +225,6 @@ jobs:
           labels: ${{ steps.docker_meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          # comma seperated list of what OS and architechtures to build for (in parallel)
-          # default is linux/amd64 (the OS of the runner) but you can add more
-          # adding linux/arm64 is recommended for Apple Silicon, Raspberry Pi, AWS Graviton, etc.
-          # linux/arm/v7 is for 32-bit ARM devices like Raspberry Pi 2/3
           platforms: linux/amd64,linux/arm64
 
       - name: Find comment for image tags 
