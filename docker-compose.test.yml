@@ -1,0 +1,7 @@
+services:
+  app:
+    image: "{TESTING_IMAGE}"
+    depends_on:
+      app:
+        condition: service_started
+    command: sh -c "wget --spider http://app:8888 || exit 1"
